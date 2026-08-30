@@ -1,0 +1,15 @@
+[Unit]
+Description=Three-camera Intel RealSense capture backend at 10 Hz
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/realsense_web_viewer
+ExecStart=/usr/bin/sg video -c "/usr/bin/python3 %h/realsense_web_viewer/server.py --bind 127.0.0.1 --port 8765 --width 424 --height 240 --fps 10 --depth-width 424 --depth-height 240 --depth-fps 5 --serials 405622073775,405622072503,401622073398"
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target
