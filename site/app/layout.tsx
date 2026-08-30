@@ -2,8 +2,8 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'PC 조립 에이전트 · Workcell Console',
-  description: 'PC 조립 데모 촬영을 위한 3카메라 에이전트 화면',
+  title: 'Agent Live Observation · Workcell Console',
+  description: 'Three-camera live observation and task monitoring console',
 };
 
 export const viewport: Viewport = {
@@ -14,7 +14,7 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="ko">
+    <html lang="en">
       <body>{children}</body>
     </html>
   );
