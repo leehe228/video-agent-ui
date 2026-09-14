@@ -63,7 +63,7 @@ type ReasoningTrace = {
 const PLAN_STEPS: PlanStep[] = [
   { title: 'Install GPU', executor: 'ROBOT', detail: 'Align · insert · verify' },
   { title: 'Install RAM', executor: 'HUMAN', detail: 'Install two modules · verify' },
-  { title: 'Handover & fasten', executor: 'ROBOT + HUMAN', detail: 'Safe handover · fastening' },
+  { title: 'Fasten components', executor: 'HUMAN', detail: 'Secure installed components · verify' },
   { title: 'Mount mainboard', executor: 'HUMAN', detail: 'Position · secure in case' },
   { title: 'Connect power', executor: 'ROBOT', detail: 'Orient · insert · verify' },
   { title: 'Power-on check', executor: 'ROBOT + AGENT', detail: 'Power on · final verification' },
@@ -72,14 +72,14 @@ const PLAN_STEPS: PlanStep[] = [
 const RECOVERY_STATE_IDS = new Set(['failed', 'demo', 'retry']);
 
 const PLANNING_EVENTS: PlanningEvent[] = [
-  { label: 'Instruction received', detail: 'Local file registered for this session' },
-  { label: 'Loading demo configuration', detail: 'Fixed mainboard assembly profile selected' },
-  { label: 'Applying component set', detail: 'Configured GPU, RAM, driver, mainboard, and power cable loaded' },
-  { label: 'Applying task constraints', detail: 'Configured order, handover, safety, and completion rules loaded' },
-  { label: 'Assigning actors', detail: 'Demo configuration maps Robot, Human, and Agent roles' },
-  { label: 'Building execution order', detail: 'Dependencies converted into six task steps' },
-  { label: 'Attaching verification gates', detail: 'Visual checks linked to each physical action' },
-  { label: 'Plan ready', detail: 'First executable task is ready to activate' },
+  { label: 'SOP received', detail: 'Work instruction added to the planning workspace' },
+  { label: 'Reading SOP structure', detail: 'Procedure sections and referenced components located' },
+  { label: 'Extracting nominal tasks', detail: 'Physical installation operations converted into task candidates' },
+  { label: 'Resolving dependencies', detail: 'Required ordering between SOP operations established' },
+  { label: 'Assigning task owners', detail: 'Robot, Human, and Agent roles mapped to nominal tasks' },
+  { label: 'Building execution order', detail: 'Dependencies converted into six SOP tasks' },
+  { label: 'Linking completion criteria', detail: 'Expected end state attached to every task' },
+  { label: 'Plan ready', detail: 'First SOP task is ready to activate' },
 ];
 
 function actorClass(actor: string) {
@@ -90,10 +90,16 @@ function actorClass(actor: string) {
   return 'actor-agent';
 }
 
+function fileFormatLabel(file: { name: string; type: string }) {
+  const extension = file.name.split('.').pop()?.trim().toUpperCase();
+  if (extension && extension !== file.name.toUpperCase()) return extension;
+  return file.type.split('/').pop()?.toUpperCase() || 'FILE';
+}
+
 const STAGE_STATES: StageState[] = [
   { id: 'standby', scene: 'S00', phase: -1, protocol: 'READY', status: 'Standby', headline: 'Waiting for a work instruction', detail: 'Monitoring cameras and the workcell', actor: 'HUMAN · ROBOT', tone: 'blue', focusCamera: 1, observation: 'No work instruction has been loaded', response: 'Keep the workcell in standby' },
   { id: 'instruction', scene: 'S01', phase: -1, protocol: 'READY', status: 'Instruction analysis', headline: 'Work instruction loaded', detail: 'Parsing parts, steps, and completion criteria', actor: 'AGENT', tone: 'blue', focusCamera: 0, observation: 'The work instruction and drawing are available', response: 'Extract goals and operating constraints' },
-  { id: 'planning', scene: 'S02', phase: -1, protocol: 'PLANNING', status: 'Plan generation', headline: 'Planning the sequence and roles', detail: 'Robot: GPU, tool, power  /  Human: RAM, fastening', actor: 'AGENT', tone: 'blue', focusCamera: 1, observation: 'Required parts and actors are identified', response: 'Assign Robot and Human roles with verification steps' },
+  { id: 'planning', scene: 'S02', phase: -1, protocol: 'PLANNING', status: 'Plan generation', headline: 'Planning the sequence and roles', detail: 'Robot: GPU, power  /  Human: RAM, fastening, mounting', actor: 'AGENT', tone: 'blue', focusCamera: 1, observation: 'Required SOP tasks and actors are identified', response: 'Assign task owners and completion criteria' },
   { id: 'plan-ready', scene: 'S02 · READY', phase: 0, protocol: 'READY', status: 'Plan ready', headline: 'Ready to begin the first task', detail: 'First task · Install GPU', actor: 'AGENT', tone: 'blue', focusCamera: 1, observation: 'The plan and completion criteria are ready', response: 'Inspect the workcell before GPU installation' },
   { id: 'observing', scene: 'S03', phase: 0, protocol: 'RUNNING', status: 'Workcell inspection', headline: 'Inspecting parts and the work area', detail: 'GPU · RAM · driver · human · target slots', actor: 'AGENT', tone: 'cyan', focusCamera: 1, observation: 'Parts and human positions are being tracked', response: 'Confirm access to the GPU and target slot' },
   { id: 'gpu', scene: 'S04', phase: 0, protocol: 'RUNNING', status: 'GPU installation', headline: 'Aligning the GPU with the target slot', detail: 'Connector orientation · slot position · bracket alignment', actor: 'ROBOT', tone: 'green', focusCamera: 2, observation: 'The GPU and PCIe slot positions are confirmed', response: 'Maintain alignment and insert the GPU' },
@@ -572,13 +578,13 @@ export default function Home() {
               />
               {instructionFile ? (
                 <div className="instruction-preview">
-                  <div className="document-title"><span>LOCAL REFERENCE</span><strong>{instructionFile.name}</strong><small>{Math.max(1, Math.round(instructionFile.size / 1024))} KB · not uploaded</small></div>
-                  <div className="document-section"><span>Selected demo profile</span><strong>Mainboard component installation</strong></div>
+                  <div className="document-title"><span>SOP SOURCE</span><strong>{instructionFile.name}</strong><small>{Math.max(1, Math.round(instructionFile.size / 1024))} KB · {fileFormatLabel(instructionFile)}</small></div>
+                  <div className="document-section"><span>Document type</span><strong>Standard operating procedure</strong></div>
                   <div className="document-grid">
                     <div><span>Components</span><strong>GPU · RAM · driver · mainboard · power cable</strong></div>
-                    <div><span>Actors</span><strong>Robot · Human · Agent</strong></div>
-                    <div><span>Completion</span><strong>Visual verification after every physical task</strong></div>
-                    <div><span>Safety</span><strong>Human proximity hold and force-limited recovery</strong></div>
+                    <div><span>Task owners</span><strong>Robot · Human · Agent verification</strong></div>
+                    <div><span>Completion criteria</span><strong>Expected visual state after each SOP task</strong></div>
+                    <div><span>Runtime adaptation</span><strong>Added from live observation during execution</strong></div>
                   </div>
                   <button type="button" onClick={() => fileInputRef.current?.click()}>Replace instruction</button>
                 </div>
@@ -586,7 +592,7 @@ export default function Home() {
                 <div className="instruction-empty">
                   <span>LOCAL INPUT</span>
                   <h1>Load a drawing or work instruction</h1>
-                  <p>The file stays on this device as a session reference. A predefined demo profile generates the plan.</p>
+                  <p>Select a local SOP to generate its nominal task sequence and task ownership.</p>
                   <button type="button" onClick={() => fileInputRef.current?.click()}>Load instruction</button>
                 </div>
               )}
