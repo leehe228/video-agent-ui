@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { parseSharedSessionPatch, type SharedSessionPatch, type SharedSessionState } from '@/lib/session-state';
 
 type Tone = 'blue' | 'cyan' | 'green' | 'amber' | 'red' | 'violet';
 type CameraStatus = 'idle' | 'connecting' | 'live' | 'error';
@@ -13,6 +14,9 @@ type RemoteCameraInfo = {
   height?: number;
   target_fps?: number;
   fps?: number;
+  requested_width?: number;
+  requested_height?: number;
+  requested_fps?: number;
   depth?: {
     status?: string;
     width?: number;
@@ -21,6 +25,9 @@ type RemoteCameraInfo = {
     fps?: number;
   };
 };
+
+type CameraProfile = { width: number; height: number; fps: number };
+type ProfileUpdateState = 'idle' | 'applying' | 'success' | 'error';
 
 type StageState = {
   id: string;
@@ -72,7 +79,7 @@ const PLAN_STEPS: PlanStep[] = [
 const RECOVERY_STATE_IDS = new Set(['failed', 'demo', 'retry']);
 
 const PLANNING_EVENTS: PlanningEvent[] = [
-  { label: 'Instruction received', detail: 'Local file registered for this session' },
+  { label: 'Instruction received', detail: 'Submitted text registered for this shared session' },
   { label: 'Loading demo configuration', detail: 'Fixed mainboard assembly profile selected' },
   { label: 'Applying component set', detail: 'Configured GPU, RAM, driver, mainboard, and power cable loaded' },
   { label: 'Applying task constraints', detail: 'Configured order, handover, safety, and completion rules loaded' },
@@ -91,8 +98,8 @@ function actorClass(actor: string) {
 }
 
 const STAGE_STATES: StageState[] = [
-  { id: 'standby', scene: 'S00', phase: -1, protocol: 'READY', status: 'Standby', headline: 'Waiting for a work instruction', detail: 'Monitoring cameras and the workcell', actor: 'HUMAN · ROBOT', tone: 'blue', focusCamera: 1, observation: 'No work instruction has been loaded', response: 'Keep the workcell in standby' },
-  { id: 'instruction', scene: 'S01', phase: -1, protocol: 'READY', status: 'Instruction analysis', headline: 'Work instruction loaded', detail: 'Parsing parts, steps, and completion criteria', actor: 'AGENT', tone: 'blue', focusCamera: 0, observation: 'The work instruction and drawing are available', response: 'Extract goals and operating constraints' },
+  { id: 'standby', scene: 'S00', phase: -1, protocol: 'READY', status: 'Standby', headline: 'Waiting for a work instruction', detail: 'Monitoring cameras and the workcell', actor: 'HUMAN · ROBOT', tone: 'blue', focusCamera: 1, observation: 'No work instruction has been submitted', response: 'Keep the workcell in standby' },
+  { id: 'instruction', scene: 'S01', phase: -1, protocol: 'READY', status: 'Instruction analysis', headline: 'Work instruction submitted', detail: 'Parsing parts, steps, and completion criteria', actor: 'AGENT', tone: 'blue', focusCamera: 0, observation: 'The submitted work instruction is available', response: 'Extract goals and operating constraints' },
   { id: 'planning', scene: 'S02', phase: -1, protocol: 'PLANNING', status: 'Plan generation', headline: 'Planning the sequence and roles', detail: 'Robot: GPU, tool, power  /  Human: RAM, fastening', actor: 'AGENT', tone: 'blue', focusCamera: 1, observation: 'Required parts and actors are identified', response: 'Assign Robot and Human roles with verification steps' },
   { id: 'plan-ready', scene: 'S02 · READY', phase: 0, protocol: 'READY', status: 'Plan ready', headline: 'Ready to begin the first task', detail: 'First task · Install GPU', actor: 'AGENT', tone: 'blue', focusCamera: 1, observation: 'The plan and completion criteria are ready', response: 'Inspect the workcell before GPU installation' },
   { id: 'observing', scene: 'S03', phase: 0, protocol: 'RUNNING', status: 'Workcell inspection', headline: 'Inspecting parts and the work area', detail: 'GPU · RAM · driver · human · target slots', actor: 'AGENT', tone: 'cyan', focusCamera: 1, observation: 'Parts and human positions are being tracked', response: 'Confirm access to the GPU and target slot' },
@@ -114,6 +121,12 @@ const STAGE_STATES: StageState[] = [
 
 const CAMERA_NAMES = ['Observation view', 'Workcell wide', 'Assembly detail'];
 const CAMERA_SHORTCUTS = ['1', '2', '3'];
+const CAMERA_RESOLUTIONS = [
+  { width: 424, height: 240, label: '424×240' },
+  { width: 640, height: 360, label: '640×360' },
+  { width: 640, height: 480, label: '640×480' },
+];
+const CAMERA_RATES = [5, 10, 15];
 
 function cameraStatusLabel(status: CameraStatus) {
   if (status === 'live') return 'Live';
@@ -139,7 +152,7 @@ const CAMERA_MESSAGE_TRANSLATIONS: Record<string, string> = {
   '카메라를 연결하지 못했습니다': 'Unable to connect cameras',
   '브라우저에서 카메라 권한을 허용해 주세요': 'Allow camera access in the browser',
   '카메라 연결을 확인해 주세요': 'Check the camera connection',
-  'RealSense 캡처 서버 연결됨 · 10Hz': 'RealSense capture server connected · 10Hz',
+  'RealSense 캡처 서버 연결됨': 'RealSense capture server connected',
   'RealSense 서버 응답 없음': 'RealSense server unavailable',
   'RealSense 캡처 서버에 연결할 수 없습니다': 'Unable to reach the RealSense capture server',
   '연결 확인 중': 'Checking connection',
@@ -161,8 +174,13 @@ export default function Home() {
   const [globalCameraMessage, setGlobalCameraMessage] = useState('카메라 3대를 연결하려면 촬영 제어를 여세요');
   const [remoteCameraMode, setRemoteCameraMode] = useState(false);
   const [remoteCameras, setRemoteCameras] = useState<RemoteCameraInfo[]>([]);
+  const [remoteProfileDrafts, setRemoteProfileDrafts] = useState<Array<CameraProfile | null>>([null, null, null]);
+  const [remoteProfileStates, setRemoteProfileStates] = useState<ProfileUpdateState[]>(['idle', 'idle', 'idle']);
+  const [remoteProfileMessages, setRemoteProfileMessages] = useState(['', '', '']);
   const [expandedCamera, setExpandedCamera] = useState<number | null>(null);
-  const [instructionFile, setInstructionFile] = useState<{ name: string; size: number; type: string } | null>(null);
+  const [instructionText, setInstructionText] = useState('');
+  const [instructionDraft, setInstructionDraft] = useState('');
+  const [editingInstruction, setEditingInstruction] = useState(false);
   const [planningProgress, setPlanningProgress] = useState(-1);
   const [agentTrace, setAgentTrace] = useState<AgentTraceEvent[]>([]);
   const [reasoningTrace, setReasoningTrace] = useState<ReasoningTrace | null>(null);
@@ -171,11 +189,15 @@ export default function Home() {
   const streamsRef = useRef<Array<MediaStream | null>>([null, null, null]);
   const requestVersionsRef = useRef([0, 0, 0]);
   const selectedDeviceIdsRef = useRef(selectedDeviceIds);
+  const sharedRevisionRef = useRef(-1);
+  const sharedWritePendingRef = useRef(0);
+  const sharedWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const sharedChannelRef = useRef<BroadcastChannel | null>(null);
+  const planningOwnerRef = useRef(false);
   const stageRef = useRef<HTMLElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const expandedCloseButtonRef = useRef<HTMLButtonElement | null>(null);
   const expandedVideoRef = useRef<HTMLVideoElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const currentState = STAGE_STATES[stageIndex];
   const isExecution = stageIndex >= 4;
   const planReady = planningProgress === PLANNING_EVENTS.length - 1;
@@ -183,13 +205,108 @@ export default function Home() {
   const planStatus = isExecution ? 'PLAN ACTIVE' : planReady ? 'S02 READY' : planningProgress >= 0 ? 'PLANNING' : 'INSTRUCTION';
   const planningHeadline = planningProgress >= 0 ? PLANNING_EVENTS[Math.min(planningProgress, PLANNING_EVENTS.length - 1)].label : 'Awaiting work instruction';
   const liveCount = useMemo(() => cameraStatuses.filter((status) => status === 'live').length, [cameraStatuses]);
+  const remoteRateLabel = useMemo(() => {
+    const rates = [0, 1, 2]
+      .map((slot) => {
+        const camera = remoteCameras.find((item) => item.slot === slot);
+        return camera?.requested_fps ?? camera?.target_fps;
+      })
+      .filter((rate): rate is number => typeof rate === 'number');
+    if (rates.length !== 3) return '—';
+    return new Set(rates).size === 1 ? `${rates[0]}Hz` : 'Mixed rates';
+  }, [remoteCameras]);
   const cameraSummary = useMemo(() => {
     if (isConnectingAll || cameraStatuses.some((status) => status === 'connecting')) return 'Connecting cameras…';
-    if (liveCount === 3) return remoteCameraMode ? 'Three RealSense cameras connected · 10Hz' : 'Three cameras connected';
+    if (liveCount === 3) return remoteCameraMode ? `Three RealSense cameras connected · ${remoteRateLabel}` : 'Three cameras connected';
     if (liveCount > 0) return `${liveCount} / 3 cameras connected`;
     if (cameraStatuses.some((status) => status === 'error')) return '0 / 3 cameras connected · Check the connection';
     return globalCameraMessage;
-  }, [cameraStatuses, globalCameraMessage, isConnectingAll, liveCount, remoteCameraMode]);
+  }, [cameraStatuses, globalCameraMessage, isConnectingAll, liveCount, remoteCameraMode, remoteRateLabel]);
+
+  const currentRemoteProfile = useCallback((slot: number): CameraProfile => {
+    const camera = remoteCameras.find((item) => item.slot === slot);
+    return {
+      width: camera?.requested_width ?? camera?.width ?? 424,
+      height: camera?.requested_height ?? camera?.height ?? 240,
+      fps: camera?.requested_fps ?? camera?.target_fps ?? 10,
+    };
+  }, [remoteCameras]);
+
+  const changeRemoteProfile = useCallback((slot: number, changes: Partial<CameraProfile>) => {
+    setRemoteProfileDrafts((previous) => previous.map((draft, index) => (
+      index === slot ? { ...(draft ?? currentRemoteProfile(slot)), ...changes } : draft
+    )));
+    setRemoteProfileStates((previous) => previous.map((state, index) => index === slot ? 'idle' : state));
+    setRemoteProfileMessages((previous) => previous.map((message, index) => index === slot ? '' : message));
+  }, [currentRemoteProfile]);
+
+  const applyRemoteProfile = useCallback(async (slot: number) => {
+    const profile = remoteProfileDrafts[slot] ?? currentRemoteProfile(slot);
+    setRemoteProfileStates((previous) => previous.map((state, index) => index === slot ? 'applying' : state));
+    setRemoteProfileMessages((previous) => previous.map((message, index) => index === slot ? 'Restarting this camera…' : message));
+    try {
+      const response = await fetch(`/api/cameras/${slot}/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(profile),
+      });
+      const payload = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      setRemoteProfileStates((previous) => previous.map((state, index) => index === slot ? 'success' : state));
+      setRemoteProfileMessages((previous) => previous.map((message, index) => index === slot ? 'Profile applied · reconnecting' : message));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to apply profile';
+      setRemoteProfileStates((previous) => previous.map((state, index) => index === slot ? 'error' : state));
+      setRemoteProfileMessages((previous) => previous.map((current, index) => index === slot ? message : current));
+    }
+  }, [currentRemoteProfile, remoteProfileDrafts]);
+
+  const publishSharedSession = useCallback((patch: SharedSessionPatch) => {
+    sharedWritePendingRef.current += 1;
+    const write = async () => {
+      try {
+        const response = await fetch('/api/session-state', {
+          method: 'PUT',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+          signal: AbortSignal.timeout(2500),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        // The polling channel reads the canonical revision. Not consuming the
+        // response body keeps later control changes from waiting on a stalled
+        // body stream in long-running MJPEG browser sessions.
+        sharedRevisionRef.current = -1;
+      } catch {
+        // Force the next successful poll to restore the canonical server state.
+        sharedRevisionRef.current = -1;
+      } finally {
+        sharedWritePendingRef.current -= 1;
+      }
+    };
+    sharedWriteQueueRef.current = sharedWriteQueueRef.current.then(write, write);
+  }, []);
+
+  const applySharedSessionPatch = useCallback((patch: SharedSessionPatch) => {
+    if (patch.stageIndex !== undefined) setStageIndex(patch.stageIndex);
+    if (patch.featuredCamera !== undefined) setFeaturedCamera(patch.featuredCamera);
+    if (patch.planningProgress !== undefined) setPlanningProgress(patch.planningProgress);
+    if (patch.instructionText !== undefined) {
+      setInstructionText(patch.instructionText);
+    }
+    if (patch.instructionEditing !== undefined) setEditingInstruction(patch.instructionEditing);
+  }, []);
+
+  const updateSharedSession = useCallback((patch: SharedSessionPatch) => {
+    applySharedSessionPatch(patch);
+    sharedChannelRef.current?.postMessage(patch);
+    publishSharedSession(patch);
+  }, [applySharedSessionPatch, publishSharedSession]);
+
+  const updateInstructionDraft = useCallback((value: string) => {
+    setInstructionDraft(value);
+    setEditingInstruction(true);
+  }, []);
 
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return [];
@@ -305,32 +422,107 @@ export default function Home() {
 
   const selectStage = useCallback((index: number) => {
     const boundedIndex = Math.min(STAGE_STATES.length - 1, Math.max(0, index));
-    setStageIndex(boundedIndex);
-    setFeaturedCamera(STAGE_STATES[boundedIndex].focusCamera);
-  }, []);
+    updateSharedSession({
+      stageIndex: boundedIndex,
+      featuredCamera: STAGE_STATES[boundedIndex].focusCamera,
+    });
+  }, [updateSharedSession]);
 
   const moveStage = useCallback((direction: number) => {
     selectStage(stageIndex + direction);
   }, [selectStage, stageIndex]);
 
-  const loadInstruction = useCallback((file: File) => {
-    setInstructionFile({ name: file.name, size: file.size, type: file.type || 'Local document' });
-    setPlanningProgress(0);
+  const editInstruction = useCallback(() => {
+    planningOwnerRef.current = false;
     setAgentTrace([]);
-    selectStage(1);
-  }, [selectStage]);
+    setReasoningTrace(null);
+    setInstructionDraft(instructionText);
+    updateSharedSession({
+      stageIndex: 0,
+      featuredCamera: 1,
+      planningProgress: -1,
+      instructionText,
+      instructionEditing: true,
+    });
+  }, [instructionText, updateSharedSession]);
+
+  const submitInstruction = useCallback(() => {
+    const submittedInstruction = instructionDraft.trim();
+    if (!submittedInstruction) return;
+    planningOwnerRef.current = true;
+    setAgentTrace([]);
+    setEditingInstruction(false);
+    updateSharedSession({
+      instructionText: submittedInstruction,
+      instructionEditing: false,
+      planningProgress: 0,
+      stageIndex: 1,
+      featuredCamera: STAGE_STATES[1].focusCamera,
+    });
+  }, [instructionDraft, updateSharedSession]);
 
   useEffect(() => {
+    if (!planningOwnerRef.current) return;
     if (planningProgress < 0 || planningProgress >= PLANNING_EVENTS.length - 1) return;
     const planningTimer = window.setTimeout(() => {
       const nextProgress = Math.min(PLANNING_EVENTS.length - 1, planningProgress + 1);
-      setPlanningProgress(nextProgress);
-      if (nextProgress < 2) selectStage(1);
-      else if (nextProgress < PLANNING_EVENTS.length - 1) selectStage(2);
-      else selectStage(3);
+      const nextStage = nextProgress < 2 ? 1 : nextProgress < PLANNING_EVENTS.length - 1 ? 2 : 3;
+      updateSharedSession({
+        planningProgress: nextProgress,
+        stageIndex: nextStage,
+        featuredCamera: STAGE_STATES[nextStage].focusCamera,
+      });
+      if (nextProgress >= PLANNING_EVENTS.length - 1) planningOwnerRef.current = false;
     }, planningProgress === 0 ? 850 : 680);
     return () => window.clearTimeout(planningTimer);
-  }, [planningProgress, selectStage]);
+  }, [planningProgress, updateSharedSession]);
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel('video-agent-ui-session');
+    sharedChannelRef.current = channel;
+    channel.onmessage = (event: MessageEvent<unknown>) => {
+      try {
+        applySharedSessionPatch(parseSharedSessionPatch(event.data));
+      } catch {
+        // Ignore malformed messages from unrelated same-origin scripts.
+      }
+    };
+    return () => {
+      sharedChannelRef.current = null;
+      channel.close();
+    };
+  }, [applySharedSessionPatch]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshSharedSession = async () => {
+      try {
+        const response = await fetch('/api/session-state', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const state = await response.json() as SharedSessionState;
+        if (cancelled || sharedWritePendingRef.current > 0 || state.revision <= sharedRevisionRef.current) return;
+        sharedRevisionRef.current = state.revision;
+        const patch: SharedSessionPatch = {
+          stageIndex: state.stageIndex,
+          featuredCamera: state.featuredCamera,
+          planningProgress: state.planningProgress,
+          instructionText: state.instructionText,
+          instructionEditing: state.instructionEditing,
+        };
+        applySharedSessionPatch(patch);
+        sharedChannelRef.current?.postMessage(patch);
+      } catch {
+        // Keep the most recent local view and reconnect on the next poll.
+      }
+    };
+    void refreshSharedSession();
+    const refreshTimer = window.setInterval(() => void refreshSharedSession(), 400);
+    return () => {
+      cancelled = true;
+      window.clearInterval(refreshTimer);
+    };
+  }, [applySharedSessionPatch]);
 
   useEffect(() => {
     if (!isExecution) return;
@@ -405,7 +597,12 @@ export default function Home() {
           return 'connecting';
         }));
         setCameraErrors([0, 1, 2].map((slot) => cameras.find((camera) => camera.slot === slot)?.error ?? ''));
-        setGlobalCameraMessage('RealSense 캡처 서버 연결됨 · 10Hz');
+        setRemoteProfileMessages((previous) => previous.map((message, slot) => (
+          message === 'Profile applied · reconnecting' && cameras.find((camera) => camera.slot === slot)?.status === 'live'
+            ? 'Profile applied'
+            : message
+        )));
+        setGlobalCameraMessage('RealSense 캡처 서버 연결됨');
       } catch {
         if (cancelled) return;
         setRemoteCameras([]);
@@ -480,12 +677,8 @@ export default function Home() {
         return;
       }
       if (expandedCamera !== null) return;
-      if (key === 'c') {
-        setControlsOpen((open) => !open);
-        return;
-      }
       const target = event.target as HTMLElement | null;
-      if (target?.matches('select, button, input')) return;
+      if (target?.matches('select, button, input, textarea')) return;
       if (key === 'arrowright' || key === 'right') {
         event.preventDefault();
         moveStage(1);
@@ -495,11 +688,11 @@ export default function Home() {
         moveStage(-1);
       }
       const cameraIndex = CAMERA_SHORTCUTS.indexOf(event.key);
-      if (cameraIndex >= 0) setFeaturedCamera(cameraIndex);
+      if (cameraIndex >= 0) updateSharedSession({ featuredCamera: cameraIndex });
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [expandedCamera, moveStage]);
+  }, [expandedCamera, moveStage, updateSharedSession]);
 
   useEffect(() => () => {
     streamsRef.current.forEach((stream) => stream?.getTracks().forEach((track) => track.stop()));
@@ -515,7 +708,7 @@ export default function Home() {
           <strong>Agent Live Observation Session</strong>
         </div>
         <div className="header-actions">
-          <span className="camera-health" role="status" aria-live="polite"><i aria-hidden="true" /> Cameras {liveCount} / 3{remoteCameraMode ? ' · 10Hz' : ''}</span>
+          <span className="camera-health demo-camera-health" role="status" aria-live="polite"><i aria-hidden="true" /> Cameras 3 / 3</span>
           <button className="settings-button" type="button" onClick={() => setControlsOpen(true)}>Scene Control</button>
         </div>
       </header>
@@ -549,8 +742,8 @@ export default function Home() {
               {planningProgress < 1 && <div className="plan-empty">Plan steps will appear here as the instruction is analyzed.</div>}
             </div>
             <div className="run-details planning-details">
-              <div><span>Source</span><strong>{instructionFile ? 'LOCAL FILE' : 'WAITING'}</strong></div>
-              <div><span>Generated</span><strong>{instructionFile ? `${generatedPlanCount} / ${PLAN_STEPS.length}` : '—'}</strong></div>
+              <div><span>Source</span><strong>{editingInstruction ? 'DRAFT' : instructionText ? 'TEXT INPUT' : 'WAITING'}</strong></div>
+              <div><span>Generated</span><strong>{instructionText && !editingInstruction ? `${generatedPlanCount} / ${PLAN_STEPS.length}` : '—'}</strong></div>
             </div>
           </aside>
         )}
@@ -558,21 +751,11 @@ export default function Home() {
         {!isExecution ? (
           <section className="planning-workspace" aria-label="Instruction analysis and plan generation">
             <article className="instruction-card">
-              <header><span>WORK INSTRUCTION</span><strong>{instructionFile ? 'LOCAL FILE' : 'NO FILE'}</strong></header>
-              <input
-                ref={fileInputRef}
-                className="instruction-input"
-                type="file"
-                accept=".pdf,.png,.jpg,.jpeg,.webp,.doc,.docx"
-                onChange={(event) => {
-                  const [file] = Array.from(event.currentTarget.files ?? []);
-                  if (file) loadInstruction(file);
-                  event.currentTarget.value = '';
-                }}
-              />
-              {instructionFile ? (
+              <header><span>WORK INSTRUCTION</span><strong>{editingInstruction ? 'DRAFT' : instructionText ? 'TEXT' : 'NO INSTRUCTION'}</strong></header>
+              {instructionText && !editingInstruction ? (
                 <div className="instruction-preview">
-                  <div className="document-title"><span>LOCAL REFERENCE</span><strong>{instructionFile.name}</strong><small>{Math.max(1, Math.round(instructionFile.size / 1024))} KB · not uploaded</small></div>
+                  <div className="document-title"><span>SUBMITTED INSTRUCTION</span><strong>Shared work instruction</strong><small>Visible on every connected display</small></div>
+                  <p className="instruction-text-content">{instructionText}</p>
                   <div className="document-section"><span>Selected demo profile</span><strong>Mainboard component installation</strong></div>
                   <div className="document-grid">
                     <div><span>Components</span><strong>GPU · RAM · driver · mainboard · power cable</strong></div>
@@ -580,15 +763,27 @@ export default function Home() {
                     <div><span>Completion</span><strong>Visual verification after every physical task</strong></div>
                     <div><span>Safety</span><strong>Human proximity hold and force-limited recovery</strong></div>
                   </div>
-                  <button type="button" onClick={() => fileInputRef.current?.click()}>Replace instruction</button>
+                  <button type="button" onClick={editInstruction}>Edit instruction</button>
                 </div>
               ) : (
-                <div className="instruction-empty">
-                  <span>LOCAL INPUT</span>
-                  <h1>Load a drawing or work instruction</h1>
-                  <p>The file stays on this device as a session reference. A predefined demo profile generates the plan.</p>
-                  <button type="button" onClick={() => fileInputRef.current?.click()}>Load instruction</button>
-                </div>
+                <form className="instruction-empty instruction-text-entry" onSubmit={(event) => { event.preventDefault(); submitInstruction(); }}>
+                  <span>TEXT INPUT</span>
+                  <h1>Enter a work instruction</h1>
+                  <p>Describe the task for the agent. Submitting starts plan generation and shares the session with every connected display.</p>
+                  <label htmlFor="work-instruction">Work instruction</label>
+                  <textarea
+                    id="work-instruction"
+                    value={instructionDraft}
+                    maxLength={4000}
+                    placeholder="Example: Install the GPU and RAM, then connect power and verify startup."
+                    onChange={(event) => updateInstructionDraft(event.currentTarget.value)}
+                    autoFocus
+                  />
+                  <div className="instruction-entry-actions">
+                    <button type="submit" disabled={!instructionDraft.trim()}>Submit instruction</button>
+                    {instructionText && <button className="cancel-edit-button" type="button" onClick={() => updateSharedSession({ instructionEditing: false })}>Cancel</button>}
+                  </div>
+                </form>
               )}
             </article>
 
@@ -596,7 +791,7 @@ export default function Home() {
               <header><div><span>AGENT PLANNING</span><strong>{planStatus}</strong></div></header>
               <ol className="planning-event-list">
                 {planningProgress < 0 ? (
-                  <li className="planning-idle"><span>READY</span><strong>Planning begins when a local instruction is selected.</strong></li>
+                  <li className="planning-idle"><span>READY</span><strong>Planning begins when a work instruction is submitted.</strong></li>
                 ) : PLANNING_EVENTS.slice(0, planningProgress + 1).map((event, index) => (
                   <li className={index === planningProgress ? 'current' : 'complete'} key={event.label}>
                     <span>{index === planningProgress && !planReady ? 'RUNNING' : 'COMPLETE'}</span>
@@ -604,7 +799,7 @@ export default function Home() {
                   </li>
                 ))}
               </ol>
-              {planReady && <button className="begin-observation-button" type="button" onClick={() => selectStage(4)}>Begin live observation</button>}
+              {planReady && <button className="begin-observation-button" type="button" onClick={() => selectStage(4)}>Confirm</button>}
             </article>
           </section>
         ) : (
@@ -670,7 +865,7 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="camera-actions">
-                      <button type="button" onClick={() => setFeaturedCamera(slot)} disabled={isFeatured}>Primary</button>
+                      <button type="button" onClick={() => updateSharedSession({ featuredCamera: slot })} disabled={isFeatured}>Primary</button>
                       <button className="expand-camera-button" type="button" onClick={() => setExpandedCamera(slot)} disabled={status !== 'live'}>Expand</button>
                     </div>
                   </article>
@@ -757,7 +952,60 @@ export default function Home() {
               <div className="remote-camera-list">
                 {CAMERA_NAMES.map((name, slot) => {
                   const camera = remoteCameras.find((item) => item.slot === slot);
-                  return <div key={name}><strong>CAM 0{slot + 1} · {name}</strong><span>{camera?.status === 'live' ? `${camera.width}×${camera.height} · ${camera.fps?.toFixed(1) ?? '0.0'}Hz` : cameraMessageLabel(camera?.error || '연결 확인 중')}</span></div>;
+                  const currentProfile = currentRemoteProfile(slot);
+                  const profile = remoteProfileDrafts[slot] ?? currentProfile;
+                  const profileChanged = profile.width !== currentProfile.width || profile.height !== currentProfile.height || profile.fps !== currentProfile.fps;
+                  const updateState = remoteProfileStates[slot];
+                  return (
+                    <div className="remote-camera-card" key={name}>
+                      <strong>CAM 0{slot + 1} · {name}</strong>
+                      <span className="remote-camera-status">
+                        {camera?.status === 'live'
+                          ? `${camera.width}×${camera.height} · ${camera.fps?.toFixed(1) ?? '0.0'}Hz`
+                          : cameraMessageLabel(camera?.error || '연결 확인 중')}
+                      </span>
+                      <div className="remote-camera-config">
+                        <label>
+                          <span>Resolution</span>
+                          <select
+                            aria-label={`CAM 0${slot + 1} resolution`}
+                            value={`${profile.width}x${profile.height}`}
+                            onChange={(event) => {
+                              const [width, height] = event.target.value.split('x').map(Number);
+                              changeRemoteProfile(slot, { width, height });
+                            }}
+                            disabled={updateState === 'applying'}
+                          >
+                            {CAMERA_RESOLUTIONS.map((resolution) => (
+                              <option key={resolution.label} value={`${resolution.width}x${resolution.height}`}>{resolution.label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          <span>Rate</span>
+                          <select
+                            aria-label={`CAM 0${slot + 1} frame rate`}
+                            value={profile.fps}
+                            onChange={(event) => changeRemoteProfile(slot, { fps: Number(event.target.value) })}
+                            disabled={updateState === 'applying'}
+                          >
+                            {CAMERA_RATES.map((rate) => <option key={rate} value={rate}>{rate}Hz</option>)}
+                          </select>
+                        </label>
+                        <button
+                          className="remote-camera-apply"
+                          type="button"
+                          onClick={() => void applyRemoteProfile(slot)}
+                          disabled={!profileChanged || updateState === 'applying'}
+                        >
+                          {updateState === 'applying' ? 'Applying…' : 'Apply'}
+                        </button>
+                      </div>
+                      {remoteProfileMessages[slot] && (
+                        <small className={`remote-camera-feedback ${updateState}`} role="status" aria-live="polite">{remoteProfileMessages[slot]}</small>
+                      )}
+                    </div>
+                  );
                 })}
               </div>
             </>
