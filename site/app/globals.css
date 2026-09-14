@@ -447,7 +447,7 @@ kbd {
 .planning-phase-list > div.generating { color: #17212b; border-left-color: var(--accent); background: #eef1f4; }
 .planning-phase-list > div.generating > span { color: var(--accent); }
 .planning-phase-list > div.generating > i { border-color: var(--accent); animation: planning-pulse 900ms ease-in-out infinite; }
-.plan-empty { margin: auto 18px; padding: 16px; color: #6d7882; border: 1px dashed #b6c0c9; background: #f5f7f8; font-size: 14px; font-weight: 650; line-height: 1.5; }
+.phase-list > .plan-empty { display: block; min-height: auto; margin: auto 18px; padding: 16px; color: #6d7882; border: 1px dashed #b6c0c9; background: #f5f7f8; font-size: 14px; font-weight: 650; line-height: 1.5; }
 .planning-details strong { font-size: 14px; }
 
 .planning-workspace {
